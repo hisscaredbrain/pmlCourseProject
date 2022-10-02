@@ -1,0 +1,232 @@
+---
+title: "ProjectReport_PML"
+author: "Harsha"
+date: "2022-10-01"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+This file and contents of this repository has been created to comply with the assessment needs of a MOOC - Practical Machine Learning by John Hopkins University as a part of the Data Science specialization track in Coursera.
+
+## Introduction
+The background and the link to data can be found in [README.md](https://github.com/hisscaredbrain/pmlCourseProject/blob/main/README.md) file.
+People regularly do is quantify how  much of a particular activity they do, but they rarely quantify how well they do it. In this project, we will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants to predict the manner in which 6 persons did the exercise. This report describes how the model is built, how cross validation is used, inference of the sample error, and reasoning behind the design choices. The prediction model will be used to predict 20 different test cases.
+
+## Working Environment
+Load the necessary libraries and install dependencies wherever needed. Set seed to ensure reproducibility while building models and working with data to ensure consistency in results.
+```{r SetUpWE, results='hide', message=FALSE, warning=FALSE}
+library(rattle)
+library(caret)
+library(dplyr)
+library(rpart)
+library(rpart.plot)
+library(corrplot)
+library(randomForest)
+library(RColorBrewer)
+
+set.seed(56789)
+```
+
+## Get the data
+The data for this exercise comes from [this source](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har).
+
+* Create a directory for data in the current working directory. 
+* Download the data files ONLY once 
+* Read in the data into variables. 
+* Delete the file handling variables to keep the working environment clean.
+```{r ReadData}
+# Set the working directory
+setwd("~/Projects/DataScience_Coursera/PracticalMachineLearning/pmlCourseProject")
+
+# URLs for training and test data
+trainDataURL <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testDataURL <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+trainfn <- "./data/pml-training.csv"
+testfn <- "./data/pml-test.csv"
+
+# Download the data files if they are not present in the data folder
+if(!file.exists(trainfn)) {
+  download.file(trainDataURL, destfile = trainfn, method = "curl")
+}
+
+if(!file.exists(testfn)) {
+  download.file(testDataURL, destfile = testfn, method = "curl")
+}
+
+# Read in the raw data, replace empty and invalid entries by NA
+trainDataRaw <- read.csv(trainfn, sep = ",", header = TRUE, na.strings = c("NA", "", '#DIV/0!'))
+testDataRaw <- read.csv(testfn, sep = ",", header = TRUE, na.strings = c("NA", "", '#DIV/0!'))
+
+# Delete file handling variables
+rm(trainDataURL)
+rm(testDataURL)
+rm(trainfn)
+rm(testfn)
+
+#Check the dimensions of read in data
+dim(trainDataRaw)
+dim(testDataRaw)
+```
+Both data sets contain 160 variables. However the size of the training data set is 19622 as compared to just 20 for test data set.
+
+## Preprocessing the data
+In this step, the data will be cleaned to exclude irrelevant, insignificant values or variables with NA.
+1. In first step, all variables with `NA`s will be identified and filtered out.
+```{r PreProcessData01}
+#Identify variables without NA
+varWONA <- (colSums(is.na(trainDataRaw)) == 0)
+
+# Filter out variables with NA
+trainValidData <- trainDataRaw[, varWONA]
+testValidData <- testDataRaw[, varWONA]
+
+# Observe the dimensions of pruned dataset
+dim(trainValidData)
+dim(testValidData)
+
+# Delete variables from work space to keep it de-cluttered
+rm(trainDataRaw)
+rm(testDataRaw)
+rm(varWONA)
+```
+
+2. Now identify and prune the set leaving out all variables with insignificant values.
+```{r PreProcessData02}
+# Identify variables with insignificant values
+InSigVar <- nearZeroVar(trainValidData, saveMetrics = TRUE)
+#head(InSigVar, 15)
+
+trainSigData <- trainValidData[, !InSigVar$nzv]
+testSigData <- testValidData[, !InSigVar$nzv]
+
+# Observe the dimensions of pruned dataset
+dim(trainSigData)
+dim(testSigData)
+
+# Delete variables from work space to keep it de-cluttered
+rm(InSigVar)
+rm(trainValidData)
+rm(testValidData)
+```
+Close to 1/3 of the variables have been pruned. We started with 160 and are now with 100 variables after account of insignificant values.
+
+3. Identify and remove variables which do not contribute or relate to accelerometer measurements.
+```{r PreProcessData03}
+nonAccel <- grepl("^X|timestamp|user_name", names(trainSigData))
+# Prune non accelerometer data
+trainAccelData <- trainSigData[, !nonAccel]
+testAccelData <- testSigData[, !nonAccel]
+# trainFinalData <- trainSigData[, !nonAccel]
+# testFinalData <- testSigData[, !nonAccel]
+
+
+# Observe the dimensions of pruned dataset
+dim(trainAccelData)
+dim(testAccelData)
+# dim(trainFinalData)
+# dim(testFinalData)
+
+
+# Delete variables from work space to keep it de-cluttered
+rm(trainSigData)
+rm(testSigData)
+rm(nonAccel)
+```
+We have further reduced the variables to 54.
+
+4. Lastly remove the variables with are non-numeric
+```{r PreProcessData04}
+numerVar <- which(lapply(trainAccelData, class) == "numeric")
+names(numerVar) <- NULL
+storeClass <- trainAccelData$classe
+trainFinalData <- trainAccelData[, numerVar]
+trainFinalData$classe <- storeClass
+
+testFinalData <- testAccelData[, numerVar]
+
+# Observe the dimensions of pruned dataset
+dim(trainFinalData)
+#dim(testFinalData)
+
+# Delete variables from work space to keep it de-cluttered
+rm(trainAccelData)
+rm(testAccelData)
+rm(numerVar)
+```
+This final data set contains less than 1/4 of variables from the raw data set. Let us look at a correlation matrix to see if we have any over-dependence on variables. Ensure to remove the problem_id column first.
+```{r CorrelationMatrix, warning=FALSE, error=FALSE}
+corrplot(cor(trainFinalData[, -length(names(trainFinalData))]), method = "color", tl.cex = 0.5)
+```
+
+
+## Split training set
+The training data set will be split into 70:30 subsets of training and validation data sets. 
+```{r SplitTrainData}
+split <- createDataPartition(trainFinalData$classe, p = 0.70, list = FALSE)
+validation <- trainFinalData[-split, ]
+onlyTrain <- trainFinalData[split, ]
+
+# Observe the dimensions of splitted datasets
+dim(onlyTrain)
+dim(validation)
+
+# Delete variables from work space to keep it de-cluttered
+rm(split)
+```
+
+## Build Models for Prediction
+In this section we explore two models - Decision Tree and the Random Forest Method.
+
+### Decision Tree
+Based on the course content, we know effectiveness of decision trees are in general lower than Random Forest. However, this hypothesis can also be tested while using them for prediction.
+
+```{r DecisionTree00}
+fitDtm <- rpart(classe ~., data=onlyTrain, method = "class")
+prp(fitDtm)
+```
+This model is now used to estimate the performance using the validation data subset.
+
+```{r DecisionTree01}
+predDtm <- predict(fitDtm, validation, type = "class")
+confusionMatrix(as.factor(validation$classe), predDtm)
+```
+Lets extract the accuracy and Out-of-Sample Error from the above matrix.
+```{r DecisionTree02}
+accuracyDtm <- postResample(predDtm, as.factor(validation$classe))
+outSampErrorDtm <- (1 - as.numeric(confusionMatrix(as.factor(validation$classe), predDtm)$overall)[1])
+
+# Delete variables from work space to keep it de-cluttered
+rm(fitDtm)
+rm(predDtm)
+```
+The estimated accuracy of the Decision Tree method is `r accuracyDtm[1]*100`% and the estimated Out-of-Sample Error is `r outSampErrorDtm*100`%.
+
+### Random Forest Method
+In the course we have learnt that random forest provides reasonably good performance with default settings. In the below model we are using 5-fold cross validation.
+
+```{r RandomForest00}
+fitRfm <- train(classe ~., method="rf", data = onlyTrain, trControl = trainControl(method = "cv", 5), ntree = 250)
+fitRfm
+```
+Now, lets use the validation data set and see the performance if the model.
+```{r RandomForest02, error=FALSE, warning=FALSE}
+predRfm <- predict(fitRfm, validation)
+confusionMatrix(as.factor(validation$classe), predRfm)
+accuracyRfm <- postResample(predRfm, as.factor(validation$classe))
+outSampErr <- (1 - as.numeric(confusionMatrix(as.factor(validation$classe), predRfm)$overall[1]))
+```
+The Estimated Accuracy of the Random Forest Model is `r accuracyRfm[1]*100`% and the Estimated Out-of-Sample Error is `r outSampErr*100`%.  
+As expected, Random Forests method yields better results in comparision to Decision Trees.
+
+## Prediction with Test Data Set  
+The Random Forest model is now applied to the original testing data set downloaded from the data source.
+```{r warning=FALSE, error=FALSE}
+predict(fitRfm, testFinalData)
+```  
